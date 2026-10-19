@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -36,6 +37,8 @@ var verboseMode bool
 var debugMode bool
 
 func main() {
+	ensureHomeEnv()
+
 	// Check for quiet mode first (before printing banner)
 	quietMode = hasFlag("-q") || hasFlag("--quiet")
 
@@ -581,6 +584,18 @@ func warnIfOutdated(db *cvedb.CVEDB) {
 	if age > 7*24*time.Hour {
 		fmt.Printf("⚠️  Warning: CVE database is %d days old. Run 'dockerscan update-db' to update.\n\n",
 			int(age.Hours()/24))
+	}
+}
+
+// ensureHomeEnv sets $HOME from the user database when it is missing.
+// Some container platforms start processes without it, which breaks the
+// ~ paths used for the CVE database and the Docker config.
+func ensureHomeEnv() {
+	if os.Getenv("HOME") != "" {
+		return
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		os.Setenv("HOME", u.HomeDir)
 	}
 }
 

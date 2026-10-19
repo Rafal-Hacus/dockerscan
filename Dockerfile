@@ -17,6 +17,8 @@ RUN cat data/latest.db.gz.part-* > /tmp/latest.db.gz \
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
+# Some platforms start containers without $HOME; the CVE database lives in it
+ENV HOME=/root
 
 COPY --from=build /out/dockerscan /usr/local/bin/dockerscan
 COPY --from=build /out/cve-db.sqlite /root/.dockerscan/cve-db.sqlite
