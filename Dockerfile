@@ -16,6 +16,7 @@ RUN cat data/latest.db.gz.part-* > /tmp/latest.db.gz \
 # Runtime stage
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
+WORKDIR /app
 
 COPY --from=build /out/dockerscan /usr/local/bin/dockerscan
 COPY --from=build /out/cve-db.sqlite /root/.dockerscan/cve-db.sqlite

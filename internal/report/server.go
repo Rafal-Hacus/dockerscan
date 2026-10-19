@@ -8,10 +8,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/cr0hn/dockerscan/v2/internal/models"
@@ -25,9 +27,21 @@ const (
 	DefaultHTTPSAddr = ":443"
 )
 
+// Scan states reported by the server until a report is available
+const (
+	StatusScanning = "scanning"
+	StatusFailed   = "failed"
+	StatusDone     = "done"
+)
+
 // Server publishes a scan result over HTTP and HTTPS.
 // It answers on every host name: the Host header is never checked and the
 // HTTPS listener presents the same certificate for any SNI value.
+//
+// The server is meant to start before the scan: every endpoint answers 200
+// from the beginning (so platform health checks pass), returning a status
+// document while scanning or after a failure, and the reports once
+// SetResult has been called.
 type Server struct {
 	HTTPAddr  string
 	HTTPSAddr string
@@ -37,37 +51,82 @@ type Server struct {
 	CertFile string
 	KeyFile  string
 
-	handler http.Handler
+	mu        sync.RWMutex
+	status    []byte
+	jsonData  []byte
+	sarifData []byte
 }
 
-// NewServer prepares a server that serves the given result
-func NewServer(result *models.ScanResult) (*Server, error) {
+// NewServer prepares a server for a scan of imageName that is in progress
+func NewServer(imageName string) *Server {
+	s := &Server{
+		HTTPAddr:  DefaultHTTPAddr,
+		HTTPSAddr: DefaultHTTPSAddr,
+	}
+	s.setStatus(imageName, StatusScanning, "")
+	return s
+}
+
+// SetResult makes the reports for a finished scan available
+func (s *Server) SetResult(result *models.ScanResult) error {
 	jsonData, err := NewJSONReporter(true).Generate(result)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build JSON report: %w", err)
+		return fmt.Errorf("failed to build JSON report: %w", err)
 	}
 	sarifData, err := NewSARIFReporter().Generate(result)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build SARIF report: %w", err)
+		return fmt.Errorf("failed to build SARIF report: %w", err)
 	}
 
-	mux := http.NewServeMux()
-	serve := func(contentType string, body []byte) http.HandlerFunc {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jsonData = jsonData
+	s.sarifData = sarifData
+	return nil
+}
+
+// SetError records that the scan of imageName failed
+func (s *Server) SetError(imageName string, scanErr error) {
+	s.setStatus(imageName, StatusFailed, scanErr.Error())
+}
+
+func (s *Server) setStatus(imageName, status, errMsg string) {
+	data, _ := json.MarshalIndent(map[string]string{
+		"status": status,
+		"image":  imageName,
+		"error":  errMsg,
+	}, "", "  ")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = data
+}
+
+func (s *Server) handler() http.Handler {
+	serve := func(contentType string, report func() []byte) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			s.mu.RLock()
+			body := report()
+			if body == nil {
+				contentType, body = "application/json", s.status
+			}
+			s.mu.RUnlock()
+
 			w.Header().Set("Content-Type", contentType)
 			w.Write(body)
 		}
 	}
-	mux.HandleFunc("/sarif", serve("application/sarif+json", sarifData))
-	mux.HandleFunc("/dockerscan-report.sarif", serve("application/sarif+json", sarifData))
-	// Catch-all: any other path returns the full JSON report
-	mux.HandleFunc("/", serve("application/json", jsonData))
+	sarif := serve("application/sarif+json", func() []byte { return s.sarifData })
 
-	return &Server{
-		HTTPAddr:  DefaultHTTPAddr,
-		HTTPSAddr: DefaultHTTPSAddr,
-		handler:   mux,
-	}, nil
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/sarif", sarif)
+	mux.HandleFunc("/dockerscan-report.sarif", sarif)
+	// Catch-all: any other path returns the full JSON report
+	mux.HandleFunc("/", serve("application/json", func() []byte { return s.jsonData }))
+	return mux
 }
 
 // ListenAndServe serves on both addresses until ctx is cancelled or a
@@ -78,14 +137,15 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 
+	handler := s.handler()
 	httpSrv := &http.Server{
 		Addr:              s.HTTPAddr,
-		Handler:           s.handler,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	httpsSrv := &http.Server{
 		Addr:              s.HTTPSAddr,
-		Handler:           s.handler,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,

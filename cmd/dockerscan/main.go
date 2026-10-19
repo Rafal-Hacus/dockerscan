@@ -88,14 +88,38 @@ func main() {
 		}
 	}
 
+	// Get image name from args
+	imageName := getImageName()
+	if imageName == "" {
+		fmt.Fprintf(os.Stderr, "\n❌ Error: No image specified.\n")
+		fmt.Fprintf(os.Stderr, "   Usage: dockerscan [options] <image>\n")
+		fmt.Fprintf(os.Stderr, "   Example: dockerscan nginx:latest\n\n")
+		os.Exit(1)
+	}
+
+	// Serve mode: listen on :80 and :443 before scanning and keep serving
+	// whatever the outcome
+	if hasFlag("--serve") {
+		os.Exit(serveAndScan(imageName))
+	}
+
+	result, err := runScan(imageName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n❌ Error: %v\n\n", err)
+		os.Exit(1)
+	}
+
+	os.Exit(exitCode(result))
+}
+
+// runScan opens the CVE database, scans the image, prints the summary and
+// writes the JSON/SARIF reports
+func runScan(imageName string) (*models.ScanResult, error) {
 	// Initialize CVE database (REQUIRED)
 	dbPath := expandPath(defaultDBPath)
 	cveDB, err := cvedb.Open(dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n❌ Error: CVE database not available.\n")
-		fmt.Fprintf(os.Stderr, "   Run 'dockerscan update-db' to download the vulnerability database.\n")
-		fmt.Fprintf(os.Stderr, "   Details: %v\n\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("CVE database not available. Run 'dockerscan update-db' to download the vulnerability database. Details: %w", err)
 	}
 	defer cveDB.Close()
 
@@ -105,15 +129,6 @@ func main() {
 	// Parse CLI arguments
 	ctx := context.Background()
 	cfg := config.NewDefaultConfig()
-
-	// Get image name from args
-	imageName := getImageName()
-	if imageName == "" {
-		fmt.Fprintf(os.Stderr, "\n❌ Error: No image specified.\n")
-		fmt.Fprintf(os.Stderr, "   Usage: dockerscan [options] <image>\n")
-		fmt.Fprintf(os.Stderr, "   Example: dockerscan nginx:latest\n\n")
-		os.Exit(1)
-	}
 
 	// Parse authentication flags
 	registryUser := getFlagValue("--registry-user")
@@ -136,15 +151,13 @@ func main() {
 	// Load authentication from all sources (CLI, env, Docker config)
 	authConfig, err := auth.NewAuthConfig(registryUser, registryPassword, registryURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up authentication: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("setting up authentication: %w", err)
 	}
 
 	// Create Docker client
 	dockerClient, err := docker.NewClient()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create Docker client: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 	defer dockerClient.Close()
 
@@ -165,8 +178,7 @@ func main() {
 	logger.Debug("Checking if image exists locally: %s", imageName)
 	exists, err := dockerClient.ImageExists(ctx, imageName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking image: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("checking image: %w", err)
 	}
 
 	if !exists {
@@ -176,14 +188,12 @@ func main() {
 		// Get registry authentication for this specific image
 		registryAuth, err := authConfig.GetRegistryAuth(imageName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting registry authentication: %v\n", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("getting registry authentication: %w", err)
 		}
 
 		// Pull image with authentication
 		if err := dockerClient.PullImage(ctx, imageName, registryAuth); err != nil {
-			fmt.Fprintf(os.Stderr, "\n%v\n", err)
-			os.Exit(1)
+			return nil, err
 		}
 		fmt.Printf("   Image pulled successfully.\n")
 		logger.Verbose("📦 Image %s pulled successfully", imageName)
@@ -205,8 +215,7 @@ func main() {
 	endTime := time.Now()
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error during scan: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("during scan: %w", err)
 	}
 
 	logger.Verbose("Scan completed in %s — %d total finding(s)", endTime.Sub(startTime), len(findings))
@@ -222,35 +231,28 @@ func main() {
 
 	// Generate reports
 	if err := generateReports(result, cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Error generating reports: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("generating reports: %w", err)
 	}
 
-	// Publish results on :80 and :443 until interrupted
-	if hasFlag("--serve") {
-		if err := serveResults(result); err != nil {
-			fmt.Fprintf(os.Stderr, "Error serving results: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	// Exit with appropriate code
-	if result.Summary.BySeverity[models.SeverityCritical] > 0 {
-		os.Exit(2) // Critical issues found
-	} else if result.Summary.BySeverity[models.SeverityHigh] > 0 {
-		os.Exit(1) // High severity issues found
-	}
-
-	os.Exit(0)
+	return result, nil
 }
 
-// serveResults exposes the JSON and SARIF reports over HTTP (:80) and
-// HTTPS (:443) for any host name, blocking until SIGINT/SIGTERM.
-func serveResults(result *models.ScanResult) error {
-	srv, err := report.NewServer(result)
-	if err != nil {
-		return err
+// exitCode maps the scan result to the process exit code
+func exitCode(result *models.ScanResult) int {
+	if result.Summary.BySeverity[models.SeverityCritical] > 0 {
+		return 2 // Critical issues found
+	} else if result.Summary.BySeverity[models.SeverityHigh] > 0 {
+		return 1 // High severity issues found
 	}
+	return 0
+}
+
+// serveAndScan starts serving on HTTP (:80) and HTTPS (:443) for any host
+// name, then runs the scan in the background. Every endpoint answers 200
+// from the start so health checks pass; the reports (or the scan error)
+// appear once the scan finishes. Blocks until SIGINT/SIGTERM.
+func serveAndScan(imageName string) int {
+	srv := report.NewServer(imageName)
 	srv.CertFile = getFlagValue("--tls-cert")
 	srv.KeyFile = getFlagValue("--tls-key")
 
@@ -258,11 +260,38 @@ func serveResults(result *models.ScanResult) error {
 	defer stop()
 
 	fmt.Printf("\n🌐 Serving results on http://*%s and https://*%s (any domain)\n", srv.HTTPAddr, srv.HTTPSAddr)
-	fmt.Printf("   /       JSON report\n")
-	fmt.Printf("   /sarif  SARIF report\n")
-	fmt.Printf("   Press Ctrl+C to stop.\n")
+	fmt.Printf("   /         JSON report (scan status until it finishes)\n")
+	fmt.Printf("   /sarif    SARIF report\n")
+	fmt.Printf("   /healthz  Health check\n")
 
-	return srv.ListenAndServe(ctx)
+	code := 1
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		result, err := runScan(imageName)
+		if err == nil {
+			err = srv.SetResult(result)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\n❌ Error: %v\n", err)
+			srv.SetError(imageName, err)
+			return
+		}
+		code = exitCode(result)
+		fmt.Printf("\n🌐 Scan finished; results are being served. Press Ctrl+C to stop.\n")
+	}()
+
+	if err := srv.ListenAndServe(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error serving results: %v\n", err)
+		return 1
+	}
+
+	select {
+	case <-scanDone:
+		return code
+	default:
+		return 1 // Stopped before the scan finished
+	}
 }
 
 func buildScanResult(target models.ScanTarget, findings []models.Finding, stats map[string]int, start, end time.Time) *models.ScanResult {
