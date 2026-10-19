@@ -1,0 +1,8 @@
+.git
+.github
+.idea
+bin
+*.sqlite
+data/latest.db.gz
+dockerscan-report.json
+*.sarif

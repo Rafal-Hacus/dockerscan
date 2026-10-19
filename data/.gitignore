@@ -1,7 +1,11 @@
 # Ignore uncompressed SQLite files (only keep compressed)
 *.sqlite
 
-# Keep compressed database and metadata
-!latest.db.gz
+# The full archive exceeds 25MB; only its split parts are committed.
+# Reassemble with: cat latest.db.gz.part-* > latest.db.gz
+latest.db.gz
+
+# Keep compressed database parts and metadata
+!latest.db.gz.part-*
 !latest.db.gz.sha256
 !metadata.json
