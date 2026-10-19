@@ -31,6 +31,11 @@ const MaxScanFileSize int64 = 25 * 1024 * 1024 // 25MB
 // Client wraps Docker operations
 type Client struct {
 	cli *client.Client
+
+	// Registry mode (no Docker daemon), see registry.go
+	registryMode  bool
+	layerCacheDir string
+	remoteImages  map[string]*remoteImage
 }
 
 // NewClient creates a new Docker client
@@ -45,6 +50,9 @@ func NewClient() (*Client, error) {
 
 // Close closes the Docker client
 func (c *Client) Close() error {
+	if c.layerCacheDir != "" {
+		os.RemoveAll(c.layerCacheDir)
+	}
 	return c.cli.Close()
 }
 
@@ -56,6 +64,11 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // ImageExists checks if an image exists locally
 func (c *Client) ImageExists(ctx context.Context, imageName string) (bool, error) {
+	if c.registryMode {
+		_, ok := c.remoteImages[imageName]
+		return ok, nil
+	}
+
 	_, err := c.cli.ImageInspect(ctx, imageName)
 	if err != nil {
 		// Use proper Docker API error type instead of string matching
@@ -69,6 +82,10 @@ func (c *Client) ImageExists(ctx context.Context, imageName string) (bool, error
 
 // PullImage pulls an image from registry with optional authentication
 func (c *Client) PullImage(ctx context.Context, imageName string, authConfig *auth.RegistryAuth) error {
+	if c.registryMode {
+		return c.pullRemote(ctx, imageName, authConfig)
+	}
+
 	pullOptions := image.PullOptions{}
 
 	// Encode authentication if provided
@@ -192,6 +209,10 @@ type HistoryEntry struct {
 
 // InspectImage retrieves detailed image information
 func (c *Client) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
+	if c.registryMode {
+		return c.inspectRemote(imageName)
+	}
+
 	inspect, err := c.cli.ImageInspect(ctx, imageName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image: %w", err)
@@ -263,6 +284,10 @@ func (c *Client) InspectImage(ctx context.Context, imageName string) (*ImageInfo
 
 // GetImageHistory retrieves image build history
 func (c *Client) GetImageHistory(ctx context.Context, imageName string) ([]HistoryEntry, error) {
+	if c.registryMode {
+		return c.historyRemote(imageName)
+	}
+
 	history, err := c.cli.ImageHistory(ctx, imageName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get image history: %w", err)
@@ -300,6 +325,10 @@ type FileContent struct {
 
 // ScanImageFiles scans all files in image layers and calls callback for each file
 func (c *Client) ScanImageFiles(ctx context.Context, imageName string, callback func(FileInfo, io.Reader) error) error {
+	if c.registryMode {
+		return c.scanRemoteFiles(imageName, callback)
+	}
+
 	// Export image as tar
 	reader, err := c.cli.ImageSave(ctx, []string{imageName})
 	if err != nil {
@@ -371,6 +400,11 @@ func (c *Client) processLayer(layerPath string, callback func(FileInfo, io.Reade
 		reader = gzReader
 	}
 
+	return processTar(reader, callback)
+}
+
+// processTar calls callback for each entry of a layer tar stream
+func processTar(reader io.Reader, callback func(FileInfo, io.Reader) error) error {
 	tarReader := tar.NewReader(reader)
 
 	for {
@@ -566,6 +600,10 @@ type MountInfo struct {
 
 // InspectContainer retrieves detailed container information
 func (c *Client) InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error) {
+	if c.registryMode {
+		return nil, fmt.Errorf("container inspection requires a Docker daemon")
+	}
+
 	inspect, err := c.cli.ContainerInspect(ctx, containerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect container: %w", err)
@@ -609,6 +647,11 @@ func (c *Client) InspectContainer(ctx context.Context, containerID string) (*Con
 
 // ListContainers lists all containers
 func (c *Client) ListContainers(ctx context.Context, all bool) ([]ContainerInfo, error) {
+	// Without a daemon there are no containers to inspect
+	if c.registryMode {
+		return nil, nil
+	}
+
 	containers, err := c.cli.ContainerList(ctx, container.ListOptions{All: all})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list containers: %w", err)
@@ -758,6 +801,10 @@ func (c *Client) VerifyImageSignature(ctx context.Context, imageName string) (bo
 
 // GetImageManifest retrieves the image manifest
 func (c *Client) GetImageManifest(ctx context.Context, imageName string) (*ImageManifest, error) {
+	if c.registryMode {
+		return nil, fmt.Errorf("image export requires a Docker daemon")
+	}
+
 	// Export image and read manifest
 	reader, err := c.cli.ImageSave(ctx, []string{imageName})
 	if err != nil {

@@ -164,6 +164,16 @@ func runScan(imageName string) (*models.ScanResult, error) {
 	}
 	defer dockerClient.Close()
 
+	// Without a Docker daemon (e.g. when running inside a container
+	// platform), pull and read the image straight from its registry
+	if err := dockerClient.Ping(ctx); err != nil {
+		fmt.Printf("\n⚠️  Docker daemon not available; reading the image directly from its registry.\n")
+		logger.Debug("Docker ping failed: %v", err)
+		if err := dockerClient.UseRegistry(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Create scanner registry
 	registry := scanner.NewRegistry()
 
