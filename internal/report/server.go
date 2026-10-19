@@ -55,6 +55,7 @@ type Server struct {
 	status    []byte
 	jsonData  []byte
 	sarifData []byte
+	fullData  []byte
 }
 
 // NewServer prepares a server for a scan of imageName that is in progress
@@ -67,11 +68,16 @@ func NewServer(imageName string) *Server {
 	return s
 }
 
-// SetResult makes the reports for a finished scan available
-func (s *Server) SetResult(result *models.ScanResult) error {
+// SetResult makes the reports for a finished scan available: result at /
+// and /sarif, and full (all findings, before triage) at /full.
+func (s *Server) SetResult(result, full *models.ScanResult) error {
 	jsonData, err := NewJSONReporter(true).Generate(result)
 	if err != nil {
 		return fmt.Errorf("failed to build JSON report: %w", err)
+	}
+	fullData, err := NewJSONReporter(true).Generate(full)
+	if err != nil {
+		return fmt.Errorf("failed to build full JSON report: %w", err)
 	}
 	sarifData, err := NewSARIFReporter().Generate(result)
 	if err != nil {
@@ -82,6 +88,7 @@ func (s *Server) SetResult(result *models.ScanResult) error {
 	defer s.mu.Unlock()
 	s.jsonData = jsonData
 	s.sarifData = sarifData
+	s.fullData = fullData
 	return nil
 }
 
@@ -123,6 +130,7 @@ func (s *Server) handler() http.Handler {
 		w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/sarif", sarif)
+	mux.HandleFunc("/full", serve("application/json", func() []byte { return s.fullData }))
 	mux.HandleFunc("/dockerscan-report.sarif", sarif)
 	// Catch-all: any other path returns the full JSON report
 	mux.HandleFunc("/", serve("application/json", func() []byte { return s.jsonData }))

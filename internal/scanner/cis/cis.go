@@ -792,8 +792,9 @@ func (s *CISScanner) checkWorldWritableFiles(ctx context.Context, imageName stri
 	maxFiles := 50
 
 	err := s.dockerClient.ScanImageFiles(ctx, imageName, func(info docker.FileInfo, _ io.Reader) error {
-		// Skip directories and check for world-writable permission (mode & 0002)
-		if !info.IsDir && info.Mode&0002 != 0 {
+		// Skip directories and links (symlinks always report 0777; hard links
+		// share their target's mode) and check for world-writable permission
+		if !info.IsDir && info.Link == "" && info.Mode&0002 != 0 {
 			worldWritableFiles = append(worldWritableFiles, info.Path)
 		}
 		return nil

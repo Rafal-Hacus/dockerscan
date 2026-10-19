@@ -22,6 +22,7 @@ import (
 	"github.com/cr0hn/dockerscan/v2/internal/scanner/secrets"
 	"github.com/cr0hn/dockerscan/v2/internal/scanner/supplychain"
 	"github.com/cr0hn/dockerscan/v2/internal/scanner/vulnerabilities"
+	"github.com/cr0hn/dockerscan/v2/internal/triage"
 	"github.com/cr0hn/dockerscan/v2/pkg/auth"
 	"github.com/cr0hn/dockerscan/v2/pkg/docker"
 	"github.com/olekukonko/tablewriter"
@@ -106,7 +107,7 @@ func main() {
 		os.Exit(serveAndScan(imageName))
 	}
 
-	result, err := runScan(imageName)
+	result, _, err := runScan(imageName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n❌ Error: %v\n\n", err)
 		os.Exit(1)
@@ -116,13 +117,14 @@ func main() {
 }
 
 // runScan opens the CVE database, scans the image, prints the summary and
-// writes the JSON/SARIF reports
-func runScan(imageName string) (*models.ScanResult, error) {
+// writes the JSON/SARIF reports. It returns the result to show (only
+// actionable findings, unless --all is given) and the full result.
+func runScan(imageName string) (*models.ScanResult, *models.ScanResult, error) {
 	// Initialize CVE database (REQUIRED)
 	dbPath := expandPath(defaultDBPath)
 	cveDB, err := cvedb.Open(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("CVE database not available. Run 'dockerscan update-db' to download the vulnerability database. Details: %w", err)
+		return nil, nil, fmt.Errorf("CVE database not available. Run 'dockerscan update-db' to download the vulnerability database. Details: %w", err)
 	}
 	defer cveDB.Close()
 
@@ -154,13 +156,13 @@ func runScan(imageName string) (*models.ScanResult, error) {
 	// Load authentication from all sources (CLI, env, Docker config)
 	authConfig, err := auth.NewAuthConfig(registryUser, registryPassword, registryURL)
 	if err != nil {
-		return nil, fmt.Errorf("setting up authentication: %w", err)
+		return nil, nil, fmt.Errorf("setting up authentication: %w", err)
 	}
 
 	// Create Docker client
 	dockerClient, err := docker.NewClient()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer dockerClient.Close()
 
@@ -170,7 +172,7 @@ func runScan(imageName string) (*models.ScanResult, error) {
 		fmt.Printf("\n⚠️  Docker daemon not available; reading the image directly from its registry.\n")
 		logger.Debug("Docker ping failed: %v", err)
 		if err := dockerClient.UseRegistry(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -191,7 +193,7 @@ func runScan(imageName string) (*models.ScanResult, error) {
 	logger.Debug("Checking if image exists locally: %s", imageName)
 	exists, err := dockerClient.ImageExists(ctx, imageName)
 	if err != nil {
-		return nil, fmt.Errorf("checking image: %w", err)
+		return nil, nil, fmt.Errorf("checking image: %w", err)
 	}
 
 	if !exists {
@@ -201,12 +203,12 @@ func runScan(imageName string) (*models.ScanResult, error) {
 		// Get registry authentication for this specific image
 		registryAuth, err := authConfig.GetRegistryAuth(imageName)
 		if err != nil {
-			return nil, fmt.Errorf("getting registry authentication: %w", err)
+			return nil, nil, fmt.Errorf("getting registry authentication: %w", err)
 		}
 
 		// Pull image with authentication
 		if err := dockerClient.PullImage(ctx, imageName, registryAuth); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		fmt.Printf("   Image pulled successfully.\n")
 		logger.Verbose("📦 Image %s pulled successfully", imageName)
@@ -228,7 +230,7 @@ func runScan(imageName string) (*models.ScanResult, error) {
 	endTime := time.Now()
 
 	if err != nil {
-		return nil, fmt.Errorf("during scan: %w", err)
+		return nil, nil, fmt.Errorf("during scan: %w", err)
 	}
 
 	logger.Verbose("Scan completed in %s — %d total finding(s)", endTime.Sub(startTime), len(findings))
@@ -237,17 +239,27 @@ func runScan(imageName string) (*models.ScanResult, error) {
 	}
 
 	// Build scan result
-	result := buildScanResult(target, findings, stats, startTime, endTime)
+	full := buildScanResult(target, findings, stats, startTime, endTime)
+
+	// Keep only findings worth investigating unless --all is given
+	result := full
+	if !hasFlag("--all") {
+		result = triage.Apply(full)
+	}
 
 	// Print summary
 	printSummary(result)
-
-	// Generate reports
-	if err := generateReports(result, cfg); err != nil {
-		return nil, fmt.Errorf("generating reports: %w", err)
+	if result != full {
+		fmt.Printf("\nℹ️  Showing %d actionable finding(s); %d duplicate or low-signal finding(s) hidden. Use --all to show everything.\n",
+			len(result.Findings), len(full.Findings)-len(result.Findings))
 	}
 
-	return result, nil
+	// Generate reports
+	if err := generateReports(result, full, cfg); err != nil {
+		return nil, nil, fmt.Errorf("generating reports: %w", err)
+	}
+
+	return result, full, nil
 }
 
 // exitCode maps the scan result to the process exit code
@@ -273,7 +285,8 @@ func serveAndScan(imageName string) int {
 	defer stop()
 
 	fmt.Printf("\n🌐 Serving results on http://*%s and https://*%s (any domain)\n", srv.HTTPAddr, srv.HTTPSAddr)
-	fmt.Printf("   /         JSON report (scan status until it finishes)\n")
+	fmt.Printf("   /         JSON report, actionable findings (scan status until it finishes)\n")
+	fmt.Printf("   /full     JSON report, all findings\n")
 	fmt.Printf("   /sarif    SARIF report\n")
 	fmt.Printf("   /healthz  Health check\n")
 
@@ -281,9 +294,9 @@ func serveAndScan(imageName string) int {
 	scanDone := make(chan struct{})
 	go func() {
 		defer close(scanDone)
-		result, err := runScan(imageName)
+		result, full, err := runScan(imageName)
 		if err == nil {
-			err = srv.SetResult(result)
+			err = srv.SetResult(result, full)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\n❌ Error: %v\n", err)
@@ -465,7 +478,7 @@ func getSeveritySymbol(severity models.Severity) string {
 	}
 }
 
-func generateReports(result *models.ScanResult, cfg *config.Config) error {
+func generateReports(result, full *models.ScanResult, cfg *config.Config) error {
 	// Generate JSON report
 	jsonReporter := report.NewJSONReporter(true)
 	if err := jsonReporter.WriteToFile(result, "dockerscan-report.json"); err != nil {
@@ -479,6 +492,14 @@ func generateReports(result *models.ScanResult, cfg *config.Config) error {
 		return fmt.Errorf("failed to write SARIF report: %w", err)
 	}
 	fmt.Printf("📄 SARIF report saved to: dockerscan-report.sarif\n")
+
+	// Keep the unfiltered findings available alongside the actionable view
+	if full != result {
+		if err := jsonReporter.WriteToFile(full, "dockerscan-report-full.json"); err != nil {
+			return fmt.Errorf("failed to write full JSON report: %w", err)
+		}
+		fmt.Printf("📄 Full JSON report (all findings) saved to: dockerscan-report-full.json\n")
+	}
 
 	return nil
 }
@@ -718,6 +739,10 @@ Options:
                       Available: cis, secrets, supplychain, vulnerabilities, runtime
   --output <dir>      Output directory for reports (default: current directory)
   --only-critical     Show only CRITICAL severity findings
+  --all               Show every finding. By default only actionable ones are
+                      shown: duplicates, LOW/INFO, hardening advice, public
+                      certificates/keys and name-only CVE matches are hidden
+                      (the full list is still saved to dockerscan-report-full.json)
   --serve             After scanning, serve all results over HTTP (:80) and
                       HTTPS (:443) for any domain until Ctrl+C
                       (GET / -> JSON report, GET /sarif -> SARIF report)

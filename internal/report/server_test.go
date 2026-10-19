@@ -36,7 +36,8 @@ func TestServerAnswersWhileScanning(t *testing.T) {
 
 func TestServerServesReportsForAnyHost(t *testing.T) {
 	srv := NewServer("nginx:latest")
-	if err := srv.SetResult(&models.ScanResult{Target: models.ScanTarget{ImageName: "nginx:latest"}}); err != nil {
+	result := &models.ScanResult{Target: models.ScanTarget{ImageName: "nginx:latest"}}
+	if err := srv.SetResult(result, result); err != nil {
 		t.Fatalf("SetResult: %v", err)
 	}
 
