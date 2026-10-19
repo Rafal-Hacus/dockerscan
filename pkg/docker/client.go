@@ -24,6 +24,10 @@ import (
 	"github.com/moby/go-archive"
 )
 
+// MaxScanFileSize is the largest file (in bytes) whose content is scanned.
+// Files above this size are skipped by SearchFileContent callers.
+const MaxScanFileSize int64 = 25 * 1024 * 1024 // 25MB
+
 // Client wraps Docker operations
 type Client struct {
 	cli *client.Client

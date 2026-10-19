@@ -374,13 +374,11 @@ func (s *SecretsScanner) scanEnvironmentVars(ctx context.Context, target models.
 func (s *SecretsScanner) scanFileContents(ctx context.Context, target models.ScanTarget) ([]models.Finding, error) {
 	var findings []models.Finding
 
-	// Maximum file size to scan (10MB)
-	const maxFileSize = 10 * 1024 * 1024
 	// Maximum number of matches to prevent memory exhaustion
 	const maxMatches = 10000
 
 	// Search for patterns in file contents
-	matches, err := s.dockerClient.SearchFileContent(ctx, target.ImageName, s.patterns, maxFileSize, maxMatches)
+	matches, err := s.dockerClient.SearchFileContent(ctx, target.ImageName, s.patterns, docker.MaxScanFileSize, maxMatches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search file content: %w", err)
 	}
@@ -516,10 +514,9 @@ func (s *SecretsScanner) scanHighEntropyStrings(ctx context.Context, target mode
 		"HIGH_ENTROPY": highEntropyPattern,
 	}
 
-	const maxFileSize = 5 * 1024 * 1024 // 5MB for entropy scanning
 	const maxMatches = 10000             // Limit matches to prevent memory exhaustion
 
-	matches, err := s.dockerClient.SearchFileContent(ctx, target.ImageName, patterns, maxFileSize, maxMatches)
+	matches, err := s.dockerClient.SearchFileContent(ctx, target.ImageName, patterns, docker.MaxScanFileSize, maxMatches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search for high entropy strings: %w", err)
 	}
