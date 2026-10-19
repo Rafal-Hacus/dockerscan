@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cr0hn/dockerscan/v2/internal/config"
@@ -224,6 +226,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Publish results on :80 and :443 until interrupted
+	if hasFlag("--serve") {
+		if err := serveResults(result); err != nil {
+			fmt.Fprintf(os.Stderr, "Error serving results: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Exit with appropriate code
 	if result.Summary.BySeverity[models.SeverityCritical] > 0 {
 		os.Exit(2) // Critical issues found
@@ -232,6 +242,27 @@ func main() {
 	}
 
 	os.Exit(0)
+}
+
+// serveResults exposes the JSON and SARIF reports over HTTP (:80) and
+// HTTPS (:443) for any host name, blocking until SIGINT/SIGTERM.
+func serveResults(result *models.ScanResult) error {
+	srv, err := report.NewServer(result)
+	if err != nil {
+		return err
+	}
+	srv.CertFile = getFlagValue("--tls-cert")
+	srv.KeyFile = getFlagValue("--tls-key")
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("\n🌐 Serving results on http://*%s and https://*%s (any domain)\n", srv.HTTPAddr, srv.HTTPSAddr)
+	fmt.Printf("   /       JSON report\n")
+	fmt.Printf("   /sarif  SARIF report\n")
+	fmt.Printf("   Press Ctrl+C to stop.\n")
+
+	return srv.ListenAndServe(ctx)
 }
 
 func buildScanResult(target models.ScanTarget, findings []models.Finding, stats map[string]int, start, end time.Time) *models.ScanResult {
@@ -566,6 +597,8 @@ func getImageName() string {
 		"--registry": true,
 		"--docker-config": true,
 		"--from-file": true,
+		"--tls-cert": true,
+		"--tls-key": true,
 	}
 
 	skipNext := false
@@ -631,6 +664,14 @@ Options:
                       Available: cis, secrets, supplychain, vulnerabilities, runtime
   --output <dir>      Output directory for reports (default: current directory)
   --only-critical     Show only CRITICAL severity findings
+  --serve             After scanning, serve all results over HTTP (:80) and
+                      HTTPS (:443) for any domain until Ctrl+C
+                      (GET / -> JSON report, GET /sarif -> SARIF report)
+  --tls-cert <file>   TLS certificate for --serve (default: self-signed)
+  --tls-key <file>    TLS private key for --serve
+
+Limits:
+  Files larger than 25 MB inside the image are skipped by content scanners.
 
 Authentication (for private registries):
   --registry-user <username>       Registry username
